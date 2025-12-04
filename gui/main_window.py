@@ -585,11 +585,23 @@ class MainWindow(QMainWindow):
         res = self._ensure_config_and_dir()
         if res is None:
             return
-        cfg, input_dir = res
+        _, input_dir = res
 
         from calibration import mkmasterbias, mkmasterdark, mkmasterflats
 
-        # Use pipeline-style collection of files (same as calib_core)
+        # Build a temporary pipeline just to get cfg with absolute directories
+        try:
+            pipeline = CalibrationPipeline(
+                str(self.current_config_path),
+                root_dir=str(input_dir),
+            )
+        except TypeError:
+            # fallback for older CalibrationPipeline without root_dir
+            pipeline = CalibrationPipeline(str(self.current_config_path))
+
+        cfg = pipeline.cfg  # this cfg now has working_dir/results_dir under input_dir
+
+        # Collect all FITS files in the selected directory
         dir_path = Path(str(input_dir)).expanduser().resolve()
         fits_files = sorted(
             str(p.resolve())
@@ -631,7 +643,7 @@ class MainWindow(QMainWindow):
             "Master frames",
             f"Master bias created at:\n{masterbias_path}\n\n"
             f"Master dark created at:\n{masterdark_path}\n\n"
-            "Master flats created (see work/ and results/aux).",
+            "Master flats created (see work/ and results/aux under your raw directory).",
         )
 
     def _run_full_calibration(self) -> None:
@@ -878,7 +890,6 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
-        # 9) Success message
         QMessageBox.information(
             self,
             "Upload completed",
