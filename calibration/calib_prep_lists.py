@@ -14,6 +14,9 @@ SUFFIXES = ["", "-b", "-d", "-bd", "-bf", "-df", "-bdf"]
 FITS_EXTENSIONS = {".fits", ".fit", ".FITS", ".FIT"}
 
 
+# ----------------------------------------------------------------------
+# Helpers used both by CLI and programmatically
+# ----------------------------------------------------------------------
 def fits_files_in_directory(directory: Path) -> List[str]:
     """Return absolute paths of FITS files in *directory* (non-recursive)."""
     return sorted(
@@ -44,7 +47,8 @@ def write_list_file(name: str, lines: Iterable[str]) -> None:
 def generate_lists(base_name: str, originals: List[str]) -> None:
     """
     Given *originals* (absolute filenames), write base and derivative list files:
-      base.lst, base-b.lst, base-d.lst, base-bd.lst, base-bf.lst, base-df.lst, base-bdf.lst
+      base.lst, base-b.lst, base-d.lst, base-bd.lst,
+      base-bf.lst, base-df.lst, base-bdf.lst
     """
     if not Path(base_name + ".lst").exists():
         write_list_file(f"{base_name}.lst", originals)
@@ -54,6 +58,9 @@ def generate_lists(base_name: str, originals: List[str]) -> None:
         write_list_file(f"{base_name}{suffix}.lst", derived)
 
 
+# ----------------------------------------------------------------------
+# Programmatic API (no sys.exit here)
+# ----------------------------------------------------------------------
 def build_lists_from_directory(directory: str) -> str:
     """
     Build .lst files from a directory with FITS files.
@@ -124,7 +131,10 @@ def build_lists_from_archive(archive: str) -> str:
         return f"{base_name}.lst"
 
 
-def _parse_args(argv: List[str] | None = None) -> argparse.Namespace:
+# ----------------------------------------------------------------------
+# CLI (optional)
+# ----------------------------------------------------------------------
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Prepare calibration file lists for FITS image processing.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -136,19 +146,17 @@ def _parse_args(argv: List[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def main(argv: List[str] | None = None) -> None:
+def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
     try:
         if args.list:
-            base = build_lists_from_list(args.list)
+            build_lists_from_list(args.list)
         elif args.directory:
-            base = build_lists_from_directory(args.directory)
+            build_lists_from_directory(args.directory)
         elif args.archive:
-            base = build_lists_from_archive(args.archive)
+            build_lists_from_archive(args.archive)
         else:
             raise RuntimeError("No valid input source specified")
-
-        print(base)
     except Exception as e:
         sys.exit(f"Error: {e}")
 

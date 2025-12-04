@@ -9,7 +9,7 @@ import shutil
 from pathlib import Path
 from typing import Callable, Optional, List
 
-from calib_config import CalibConfig
+from calibration.calib_config import CalibConfig
 from calibration import (
     mkmasterbias,
     mkmasterdark,

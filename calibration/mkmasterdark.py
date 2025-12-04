@@ -3,87 +3,61 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 from typing import List, Optional
 
 import numpy as np
 from astropy.io import fits
 from astropy.visualization import ZScaleInterval
+import matplotlib.pyplot as plt
 
-from calib_config import CalibConfig
-
-
-def _get_image_type(header, cfg: CalibConfig) -> str:
-    key = cfg.get("HEADER_SPECIFICATION", "image_type_keyword", "IMAGETYP")
-    return str(header.get(key, "")).strip().upper()
-
-
-def _get_exptime(header, cfg: CalibConfig) -> float:
-    key = cfg.get("HEADER_SPECIFICATION", "exposure_keyword", "EXPTIME")
-    try:
-        return float(header.get(key, 0.0))
-    except Exception:
-        return 0.0
+try:
+    from .calib_config import CalibConfig
+except ImportError:
+    from calibration.calib_config import CalibConfig
 
 
-def _get_dark_label(cfg: CalibConfig) -> str:
-    val = cfg.get("DARK_SUBTRACTION", "dark_keyword")
-    if val is not None:
-        return str(val).strip().upper()
-    val = cfg.get("HEADER_SPECIFICATION", "dark_keyword")
-    if val is not None:
-        return str(val).strip().upper()
-    return "DARK"
+def find_dark_frames(files: List[str], cfg: CalibConfig, verbose: bool = False) -> List[str]:
+    """
+    Select dark frames using HEADER_SPECIFICATION.image_type_keyword
+    and DARK_SUBTRACTION.dark_keyword.
+    """
+    image_type_key = cfg.get("HEADER_SPECIFICATION", "image_type_keyword", "IMAGETYP")
+    expected_dark = str(cfg.get("DARK_SUBTRACTION", "dark_keyword", "DARK")).strip().upper()
 
-
-def find_dark_frames(
-    files: List[str],
-    cfg: CalibConfig,
-    verbose: bool = False,
-) -> List[str]:
-    dark_label = _get_dark_label(cfg)
-    result: List[str] = []
-
+    dark_files: List[str] = []
     for fname in files:
         try:
-            with fits.open(fname, memmap=True) as hdul:
-                header = hdul[0].header
-                imagetyp = _get_image_type(header, cfg)
-                if imagetyp == dark_label:
-                    result.append(fname)
+            with fits.open(fname, memmap=False) as hdul:
+                hdr = hdul[0].header
+                imagetyp = str(hdr.get(image_type_key, "")).strip().upper()
+                if imagetyp == expected_dark:
+                    dark_files.append(fname)
         except Exception as e:
             if verbose:
                 print(f"[mkmasterdark] Skipping {fname}: {e}")
 
     if verbose:
-        print(f"[mkmasterdark] Found {len(result)} dark frames (label = {dark_label}).")
-    return sorted(result)
+        print(f"[mkmasterdark] Found {len(dark_files)} dark frames.")
+    return sorted(dark_files)
 
 
-def make_png(fits_path: str | Path, verbose: bool = False) -> str:
-    from matplotlib import pyplot as plt
-
-    fits_path = Path(fits_path)
-    png_path = fits_path.with_suffix(".png")
-
-    with fits.open(fits_path, memmap=True) as hdul:
+def make_png(fits_path: Path, png_path: Path, verbose: bool = False) -> None:
+    """Create a PNG preview of the master dark."""
+    with fits.open(fits_path, memmap=False) as hdul:
         data = hdul[0].data
 
     interval = ZScaleInterval()
     vmin, vmax = interval.get_limits(data)
-
-    plt.figure()
-    plt.imshow(data, origin="lower", cmap="gray", vmin=vmin, vmax=vmax)
-    plt.colorbar(label="ADU (zscale)")
+    plt.imshow(data, origin="lower", vmin=vmin, vmax=vmax, cmap="gray")
+    plt.colorbar(label="Pixel value (zscale)")
     plt.title("Master Dark")
-    plt.tight_layout()
-    plt.savefig(png_path, dpi=200)
+    plt.savefig(png_path, dpi=300, bbox_inches="tight")
     plt.close()
 
     if verbose:
-        print(f"[mkmasterdark] PNG preview saved to {png_path}")
-
-    return str(png_path)
+        print(f"[mkmasterdark] PNG saved to {png_path}")
 
 
 def make_master_dark(
@@ -91,145 +65,153 @@ def make_master_dark(
     cfg: CalibConfig,
     output_filename: str = "masterdark.fits",
     method: Optional[str] = None,
-    make_png: bool = False,
+    make_png_flag: bool = False,
     verbose: bool = False,
 ) -> str:
     """
-    Create a master dark frame from all_files, using config-driven settings.
+    Create a master dark frame from all_files, OR load it from library
+    depending on the config.
+
     Returns full path to master dark FITS file.
     """
     full_cfg = cfg.config
+    working_dir = Path(cfg.get("DATA_STRUCTURE", "working_dir", "./work"))
+    results_aux_dir = Path(cfg.get("DATA_STRUCTURE", "results_aux_dir", "./results/aux"))
+    working_dir.mkdir(parents=True, exist_ok=True)
+    results_aux_dir.mkdir(parents=True, exist_ok=True)
+
     dark_enabled = full_cfg.get("IMAGE_PROCESSING", {}).get("dark_correction", True)
+
+    # --- Library mode for darks --------------------------------------
+    dark_lib_cfg = full_cfg.get("DARK_SUBTRACTION", {})
+    use_dark_library = bool(dark_lib_cfg.get("library_files", False))
+
+    if use_dark_library:
+        flat_cfg = full_cfg.get("FLAT_CORRECTION", {})
+        lib_dark_name = flat_cfg.get("library_dark", "masterdark.fits")
+
+        candidates = [
+            results_aux_dir / lib_dark_name,
+            working_dir / lib_dark_name,
+        ]
+        for c in candidates:
+            if c.is_file():
+                if verbose:
+                    print(f"[mkmasterdark] Using library master dark: {c}")
+                return str(c)
+
+        raise FileNotFoundError(
+            f"[mkmasterdark] DARK_SUBTRACTION.library_files=True but "
+            f"no library dark '{lib_dark_name}' found in {results_aux_dir} or {working_dir}"
+        )
+
+    # --- Normal mode: build from dark frames -------------------------
     if not dark_enabled:
         if verbose:
             print("[mkmasterdark] Dark correction disabled in config; not creating master dark.")
-        working_dir = Path(cfg.get("DATA_STRUCTURE", "working_dir", "./work"))
-        working_dir.mkdir(parents=True, exist_ok=True)
         return str(working_dir / output_filename)
 
-    method_cfg = method or full_cfg.get("IMAGE_PROCESSING", {}).get(
-        "dark_correction_method", "ScaledExposureMedian"
+    method_cfg = (
+        method
+        or full_cfg.get("IMAGE_PROCESSING", {}).get("dark_correction_method")
+        or full_cfg.get("DARK_SUBTRACTION", {}).get("option")
+        or "ScaledExposureMedian"
     )
-
-    working_dir = Path(cfg.get("DATA_STRUCTURE", "working_dir", "./work"))
-    working_dir.mkdir(parents=True, exist_ok=True)
-    out_path = working_dir / output_filename
 
     dark_files = find_dark_frames(all_files, cfg, verbose=verbose)
     if not dark_files:
-        raise RuntimeError("[mkmasterdark] No dark frames found; cannot create master dark.")
+        raise RuntimeError("[mkmasterdark] No dark frames found to build master dark.")
 
-    if verbose:
-        print(f"[mkmasterdark] Combining {len(dark_files)} dark frames using {method_cfg}.")
+    exptime_key = cfg.get("HEADER_SPECIFICATION", "exposure_keyword", "EXPTIME")
 
     data_list = []
-    exp_list = []
+    exptime_list = []
 
     for fname in dark_files:
-        with fits.open(fname, memmap=True) as hdul:
-            header = hdul[0].header
-            exptime = _get_exptime(header, cfg)
+        with fits.open(fname, memmap=False) as hdul:
             data = hdul[0].data.astype(np.float32)
+            exp = float(hdul[0].header.get(exptime_key, 0.0))
+            if exp <= 0:
+                if verbose:
+                    print(f"[mkmasterdark] Skipping {fname}: invalid exposure {exp}")
+                continue
             data_list.append(data)
-            exp_list.append(exptime if exptime > 0 else 1.0)
+            exptime_list.append(exp)
 
-    method_lower = str(method_cfg).lower()
-    per_second = False
+    if not data_list:
+        raise RuntimeError("[mkmasterdark] No valid dark frames left after exposure checks.")
 
-    if method_lower in {"scaledexposuremedian", "scaledexposureaverage"}:
-        # Build per-second dark frames
-        scaled = [arr / expt for arr, expt in zip(data_list, exp_list)]
-        stack = np.stack(scaled, axis=0)
-        if method_lower == "scaledexposureaverage":
-            master = np.mean(stack, axis=0)
-        else:
-            master = np.median(stack, axis=0)
-        per_second = True
+    stack = np.stack(data_list, axis=0)
+    exptimes = np.array(exptime_list, dtype=np.float32)
+
+    if method_cfg == "ScaledExposureMedian":
+        scaled = stack / exptimes[:, None, None]
+        master_dark = np.median(scaled, axis=0)
+    elif method_cfg == "ScaledExposureAverage":
+        scaled = stack / exptimes[:, None, None]
+        master_dark = np.mean(scaled, axis=0)
+    elif method_cfg == "EqualExposure":
+        # assume same exposure, just median
+        master_dark = np.median(stack, axis=0)
     else:
-        # Simple median combination, assuming exposures are equal / similar
-        stack = np.stack(data_list, axis=0)
-        master = np.median(stack, axis=0)
-        per_second = False
         if verbose:
-            print(
-                "[mkmasterdark] Using simple median combination without exposure scaling. "
-                "Ensure dark exposures are consistent."
-            )
+            print(f"[mkmasterdark] Unsupported method '{method_cfg}', falling back to ScaledExposureMedian.")
+        scaled = stack / exptimes[:, None, None]
+        master_dark = np.median(scaled, axis=0)
 
-    hdu = fits.PrimaryHDU(master.astype(np.float32))
-    hdr = hdu.header
-    hdr["HISTORY"] = "Master dark created by mkmasterdark.py"
-    hdr["MD_NFRM"] = (len(dark_files), "Number of dark frames")
-    hdr["MD_METH"] = (str(method_cfg), "Dark combination method")
-    hdr["MD_PERSEC"] = (per_second, "True if dark scaled to 1 sec")
-
+    out_path = working_dir / output_filename
+    hdu = fits.PrimaryHDU(master_dark.astype(np.float32))
+    hdu.header["MD_COMB"] = (method_cfg, "Master dark combination method")
     hdu.writeto(out_path, overwrite=True)
 
-    if verbose:
-        print(f"[mkmasterdark] Master dark saved to {out_path}")
+    aux_path = results_aux_dir / output_filename
+    aux_path.write_bytes(out_path.read_bytes())
 
-    if make_png:
-        make_png(out_path, verbose=verbose)
+    if verbose:
+        print(f"[mkmasterdark] Master dark written to {out_path}")
+        print(f"[mkmasterdark] Copy stored to {aux_path}")
+
+    if make_png_flag:
+        png_path = out_path.with_suffix(".png")
+        make_png(out_path, png_path, verbose=verbose)
 
     return str(out_path)
 
 
-# ----------------------------------------------------------------------
-# CLI
-# ----------------------------------------------------------------------
-def _cli():
-    parser = argparse.ArgumentParser(description="Create master dark from list of FITS files.")
-    parser.add_argument(
-        "-l",
-        "--list",
-        required=True,
-        help="Text file with FITS paths (one per line).",
-    )
-    parser.add_argument(
-        "-c",
-        "--config",
-        required=True,
-        help="Path to LISNYKY_Moravian-C4-16000.ini",
-    )
-    parser.add_argument(
-        "-o",
-        "--output",
-        default="masterdark.fits",
-        help="Output master dark filename (inside working_dir).",
-    )
-    parser.add_argument(
-        "-m",
-        "--method",
-        help="Override dark combination method (config: IMAGE_PROCESSING.dark_correction_method).",
-    )
-    parser.add_argument(
-        "-p",
-        "--png",
-        action="store_true",
-        help="Create PNG preview of the master dark.",
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Verbose logging.",
-    )
+def _read_list_file(list_path: Path) -> List[str]:
+    with list_path.open("r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
 
-    args = parser.parse_args()
+
+def main(argv: Optional[list[str]] = None) -> None:
+    parser = argparse.ArgumentParser(
+        description="Create a master dark frame using settings from config.ini"
+    )
+    parser.add_argument("-l", "--list", required=True, help="Text file with list of FITS files")
+    parser.add_argument("-o", "--output", required=True, help="Output master dark filename")
+    parser.add_argument("-m", "--method", help="Override dark correction method")
+    parser.add_argument("-c", "--config", default="config.ini", help="Path to config .ini file")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
+    parser.add_argument("-p", "--png", action="store_true", help="Create PNG preview")
+    args = parser.parse_args(argv)
+
     cfg = CalibConfig(args.config)
+    files = _read_list_file(Path(args.list))
 
-    with open(args.list, "r", encoding="utf-8") as f:
-        files = [line.strip() for line in f if line.strip()]
-
-    make_master_dark(
-        files,
-        cfg,
-        output_filename=args.output,
-        method=args.method,
-        make_png=args.png,
-        verbose=args.verbose,
-    )
+    try:
+        out_path = make_master_dark(
+            all_files=files,
+            cfg=cfg,
+            output_filename=args.output,
+            method=args.method,
+            make_png_flag=args.png,
+            verbose=args.verbose,
+        )
+        if args.verbose:
+            print(f"[mkmasterdark] Done. Master dark at: {out_path}")
+    except Exception as e:
+        sys.exit(f"[mkmasterdark] ERROR: {e}")
 
 
 if __name__ == "__main__":
-    _cli()
+    main()

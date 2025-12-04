@@ -2,133 +2,121 @@
 
 from __future__ import annotations
 
-import argparse
+import sys
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 from astropy.io import fits
 
-from calib_config import CalibConfig
+try:
+    from .calib_config import CalibConfig
+except ImportError:
+    from calibration.calib_config import CalibConfig
 
 
-def _get_image_type(header, cfg: CalibConfig) -> str:
-    key = cfg.get("HEADER_SPECIFICATION", "image_type_keyword", "IMAGETYP")
-    return str(header.get(key, "")).strip().upper()
+def _read_list(list_path: Path) -> List[str]:
+    with list_path.open("r", encoding="utf-8") as f:
+        return [line.strip() for line in f if line.strip()]
 
 
-def _get_bias_label(cfg: CalibConfig) -> str:
-    val = cfg.get("BIAS_SUBTRACTION", "bias_keyword")
-    if val is not None:
-        return str(val).strip().upper()
-    val = cfg.get("HEADER_SPECIFICATION", "bias_keyword")
-    if val is not None:
-        return str(val).strip().upper()
-    return "BIAS"
+def _write_list(list_path: Path, items: List[str]) -> None:
+    with list_path.open("w", encoding="utf-8") as f:
+        for it in items:
+            f.write(it + "\n")
 
 
 def apply_bias_correction(
-    input_files: List[str],
-    masterbias_path: str,
+    list_in: str,
+    list_out: str,
+    masterbias_file: str,
     cfg: CalibConfig,
     verbose: bool = False,
-) -> List[str]:
+) -> None:
     """
-    Subtract master bias from all non-bias frames.
-
-    Returns list of newly created bias-corrected file paths.
+    Subtract masterbias from all frames that are NOT bias frames.
+    Uses HEADER_SPECIFICATION.image_type_keyword and BIAS_SUBTRACTION.bias_keyword.
     """
-    bias_label = _get_bias_label(cfg)
-    masterbias_path = Path(masterbias_path)
-
+    masterbias_path = Path(masterbias_file)
     if not masterbias_path.is_file():
-        raise FileNotFoundError(f"Master bias not found: {masterbias_path}")
+        raise FileNotFoundError(f"Master bias file not found: {masterbias_path}")
 
-    if verbose:
-        print(f"[bias_correction] Using master bias: {masterbias_path}")
+    with fits.open(masterbias_path, memmap=False) as hdul:
+        mb_data = hdul[0].data.astype(np.float32)
 
-    with fits.open(masterbias_path, memmap=True) as hdul_mb:
-        mb_data = hdul_mb[0].data.astype(np.float32)
+    image_type_key = cfg.get("HEADER_SPECIFICATION", "image_type_keyword", "IMAGETYP")
+    bias_label = str(cfg.get("BIAS_SUBTRACTION", "bias_keyword", "BIAS")).strip().upper()
 
-    corrected_files: List[str] = []
+    files_in = _read_list(Path(list_in))
+    out_files: List[str] = []
 
-    for fname in input_files:
-        try:
-            fname_path = Path(fname)
-            with fits.open(fname_path, memmap=True) as hdul:
-                header = hdul[0].header
-                imagetyp = _get_image_type(header, cfg)
-
-                if imagetyp == bias_label:
-                    # Do not bias-subtract bias frames themselves
-                    if verbose:
-                        print(f"[bias_correction] Skipping bias frame: {fname}")
-                    continue
-
-                data = hdul[0].data.astype(np.float32)
-                corrected = data - mb_data
-
-                new_name = fname_path.with_name(fname_path.stem + "-b" + fname_path.suffix)
-                hdu = fits.PrimaryHDU(corrected.astype(np.float32), header=header)
-                hdr = hdu.header
-                hdr["HISTORY"] = "Bias subtraction applied"
-                hdr["MB_FILE"] = (masterbias_path.name, "Master bias file")
-
-                hdu.writeto(new_name, overwrite=True)
-                corrected_files.append(str(new_name))
-
-                if verbose:
-                    print(f"[bias_correction] Wrote bias-corrected frame: {new_name}")
-
-        except Exception as e:
+    for fname in files_in:
+        p = Path(fname)
+        if not p.is_file():
             if verbose:
-                print(f"[bias_correction] Error processing {fname}: {e}")
+                print(f"[bias_correction] Missing file: {fname}")
+            continue
 
-    if verbose:
-        print(f"[bias_correction] Created {len(corrected_files)} bias-corrected frames.")
-    return corrected_files
+        try:
+            with fits.open(p, memmap=False) as hdul:
+                hdr = hdul[0].header
+                data = hdul[0].data.astype(np.float32)
+
+            imagetyp = str(hdr.get(image_type_key, "")).strip().upper()
+            if imagetyp == bias_label:
+                # don't subtract bias from bias frames
+                if verbose:
+                    print(f"[bias_correction] Skipping bias frame: {fname}")
+                continue
+
+            corrected = data - mb_data
+
+            # build output name: stem-b.fits
+            new_stem = p.stem
+            if not new_stem.endswith("-b"):
+                new_stem = new_stem + "-b"
+            out_path = p.with_name(new_stem + p.suffix)
+
+            hdu = fits.PrimaryHDU(corrected.astype(np.float32), header=hdr)
+            hdu.writeto(out_path, overwrite=True)
+
+            if verbose:
+                print(f"[bias_correction] Wrote {out_path}")
+
+            out_files.append(str(out_path.resolve()))
+        except Exception as e:
+            print(f"[bias_correction] Skipping {fname}: {e}")
+
+    if out_files:
+        _write_list(Path(list_out), out_files)
+        if verbose:
+            print(f"[bias_correction] Output list written to {list_out}")
+    else:
+        if verbose:
+            print("[bias_correction] No files were bias-corrected.")
 
 
-# ----------------------------------------------------------------------
-# CLI
-# ----------------------------------------------------------------------
-def _cli():
-    parser = argparse.ArgumentParser(
-        description="Apply master bias to a list of FITS frames (cli version)."
-    )
-    parser.add_argument(
-        "-l",
-        "--list",
-        required=True,
-        help="Text file with FITS paths (one per line).",
-    )
-    parser.add_argument(
-        "-b",
-        "--masterbias",
-        required=True,
-        help="Path to master bias FITS file.",
-    )
-    parser.add_argument(
-        "-c",
-        "--config",
-        required=True,
-        help="Path to LISNYKY_Moravian-C4-16000.ini",
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Verbose logging.",
-    )
+def main(argv: Optional[list[str]] = None) -> None:
+    if len(sys.argv) < 5:
+        print(
+            "Usage: python bias_correction.py "
+            "<list_of_input_files> <list_of_output_files> "
+            "<path_to_masterbias_file> <path_to_config_file>"
+        )
+        sys.exit(1)
 
-    args = parser.parse_args()
-    cfg = CalibConfig(args.config)
+    list_in = sys.argv[1]
+    list_out = sys.argv[2]
+    masterbias_file = sys.argv[3]
+    config_file = sys.argv[4]
+    verbose = True  # you can change to False if you want it quieter
 
-    with open(args.list, "r", encoding="utf-8") as f:
-        files = [line.strip() for line in f if line.strip()]
-
-    apply_bias_correction(files, args.masterbias, cfg, verbose=args.verbose)
+    cfg = CalibConfig(config_file)
+    try:
+        apply_bias_correction(list_in, list_out, masterbias_file, cfg, verbose=verbose)
+    except Exception as e:
+        sys.exit(f"[bias_correction] ERROR: {e}")
 
 
 if __name__ == "__main__":
-    _cli()
+    main()
