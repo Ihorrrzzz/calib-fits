@@ -32,12 +32,14 @@ def apply_dark_correction(
     masterdark_file: str,
     cfg: CalibConfig,
     verbose: bool = False,
-) -> None:
+) -> List[str]:
     """
     Subtract scaled masterdark from all non-bias, non-dark frames.
 
     Master dark is assumed to be "per second" if created via ScaledExposure* methods,
     thus we do: data - exposure * masterdark.
+
+    Returns list of output filenames that were dark-corrected.
     """
     md_path = Path(masterdark_file)
     if not md_path.is_file():
@@ -103,9 +105,11 @@ def apply_dark_correction(
         _write_list(Path(list_out), out_files)
         if verbose:
             print(f"[dark_correction] Output list written to {list_out}")
+        return out_files
     else:
         if verbose:
             print("[dark_correction] No files were dark-corrected.")
+        return []
 
 
 def main(argv: Optional[list[str]] = None) -> None:

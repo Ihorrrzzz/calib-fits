@@ -13,6 +13,7 @@ from matplotlib.figure import Figure
 from PySide6.QtCore import Qt, QTimer, Slot
 from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
+    QApplication,
     QMainWindow,
     QWidget,
     QFileDialog,
@@ -29,8 +30,8 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QCheckBox,
     QStatusBar,
-    QInputDialog,
     QDialog,
+    QInputDialog,
 )
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -41,6 +42,7 @@ if str(ROOT_DIR) not in sys.path:
 
 from calibration.calib_config import CalibConfig  # noqa: E402
 import bhtom_api  # noqa: E402
+from calibration.calib_core import CalibrationPipeline  # noqa: E402
 from gui.bhtom_login_dialog import BHTOMLoginDialog  # noqa: E402
 
 
@@ -131,19 +133,32 @@ class MainWindow(QMainWindow):
         self.blink_timer.setInterval(500)
         self.blink_timer.timeout.connect(self._on_blink_timer)
 
-        # BHTOM session
+        # BHTOM auth
         self.bhtom_token: Optional[str] = None
         self.bhtom_username: Optional[str] = None
 
-        # Calibrated frames ready for upload
+        # Remember last used BHTOM parameters for convenience
+        self.last_bhtom_target: Optional[str] = None
+        self.last_bhtom_observatory: Optional[str] = None
+        self.last_bhtom_filter: Optional[str] = None
+
+        # List of fully calibrated science frames (-bdf) for potential upload
         self.calibrated_files: List[Path] = []
 
         self._create_actions()
         self._create_menu_and_toolbar()
         self._create_status_bar()
         self._create_central_layout()
-        self._restore_bhtom_session()
         self._load_config_profiles()
+
+        # Try restore saved BHTOM session
+        username, token = bhtom_api.load_credentials()
+        if username and token:
+            self.bhtom_username = username
+            self.bhtom_token = token
+
+        # Initialize BHTOM UI (button text + status label + upload enabled/disabled)
+        self._refresh_bhtom_ui()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -287,17 +302,10 @@ class MainWindow(QMainWindow):
         btn_full = QPushButton("3. Run full calibration")
         btn_full.clicked.connect(self._run_full_calibration)
 
-        # Upload to BHTOM – appears only when we detect calibrated files
-        self.btn_upload_bhtom = QPushButton("Upload calibrated frames to BHTOM")
-        self.btn_upload_bhtom.setProperty("variant", "primary")
-        self.btn_upload_bhtom.setVisible(False)
-        self.btn_upload_bhtom.clicked.connect(self._on_upload_calibrated_to_bhtom)
-
         layout.addWidget(box_run)
         layout.addWidget(btn_prepare)
         layout.addWidget(btn_masters)
         layout.addWidget(btn_full)
-        layout.addWidget(self.btn_upload_bhtom)
         layout.addStretch()
 
         return w
@@ -342,17 +350,25 @@ class MainWindow(QMainWindow):
         lbl = QLabel("Connect your BHTOM account to upload calibrated files.")
         lbl.setWordWrap(True)
 
-        self.btn_bhtom_connect = QPushButton("Connect to BHTOM…")
-        self.btn_bhtom_connect.clicked.connect(self._on_bhtom_connect_clicked)
+        # store button as an attribute so we can change its text
+        self.btn_bhtom_connect = QPushButton()
+        self.btn_bhtom_connect.clicked.connect(self._on_bhtom_connect_or_logout)
 
         self.lbl_bhtom_status = QLabel("Not connected")
         self.lbl_bhtom_status.setObjectName("sectionTitle")
+
+        self.btn_upload_calibrated = QPushButton("Upload calibrated frames to BHTOM…")
+        self.btn_upload_calibrated.setVisible(False)
+        self.btn_upload_calibrated.setEnabled(False)
+        self.btn_upload_calibrated.clicked.connect(self._on_upload_calibrated_clicked)
 
         v_bhtom.addWidget(lbl)
         v_bhtom.addSpacing(4)
         v_bhtom.addWidget(self.btn_bhtom_connect)
         v_bhtom.addSpacing(6)
         v_bhtom.addWidget(self.lbl_bhtom_status)
+        v_bhtom.addSpacing(6)
+        v_bhtom.addWidget(self.btn_upload_calibrated)
 
         # Astrometry.net (future)
         box_ast = QGroupBox("Astrometry.net (future)")
@@ -369,6 +385,41 @@ class MainWindow(QMainWindow):
         layout.addWidget(box_ast)
         layout.addStretch()
         return w
+
+    def _refresh_bhtom_ui(self) -> None:
+        if self.bhtom_token:
+            self.btn_bhtom_connect.setText("Log out")
+            self.lbl_bhtom_status.setText(
+                f"Connected as {self.bhtom_username or 'unknown'}"
+            )
+            if self.calibrated_files:
+                self.btn_upload_calibrated.setEnabled(True)
+        else:
+            self.btn_bhtom_connect.setText("Connect to BHTOM…")
+            if not self.bhtom_username:
+                self.lbl_bhtom_status.setText("Not connected")
+            self.btn_upload_calibrated.setEnabled(False)
+
+    def _on_bhtom_connect_or_logout(self) -> None:
+        if self.bhtom_token:
+            # logout
+            ans = QMessageBox.question(
+                self,
+                "Log out from BHTOM",
+                "Do you really want to log out from BHTOM?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if ans != QMessageBox.Yes:
+                return
+            bhtom_api.clear_credentials()
+            self.bhtom_token = None
+            self.bhtom_username = None
+            self._refresh_bhtom_ui()
+            self.lbl_status.setText("BHTOM: logged out")
+        else:
+            # connect
+            self._connect_bhtom()
 
     # ------------------------------------------------------------------
     # Config handling
@@ -458,7 +509,9 @@ class MainWindow(QMainWindow):
     def _on_blink_timer(self) -> None:
         if not self.loaded_frames:
             return
-        self.current_frame_index = (self.current_frame_index + 1) % len(self.loaded_frames)
+        self.current_frame_index = (self.current_frame_index + 1) % len(
+            self.loaded_frames
+        )
         self._show_current_frame()
 
     def _toggle_blink(self, state: int) -> None:
@@ -467,7 +520,9 @@ class MainWindow(QMainWindow):
         else:
             self.blink_timer.stop()
 
-    def _update_coords(self, x: Optional[int], y: Optional[int], val: Optional[float]) -> None:
+    def _update_coords(
+        self, x: Optional[int], y: Optional[int], val: Optional[float]
+    ) -> None:
         if x is None or y is None or val is None:
             self.lbl_coords.setText("x: –, y: –, I: –")
         else:
@@ -480,17 +535,23 @@ class MainWindow(QMainWindow):
         text = self.txt_input_dir.text().strip()
         if not text:
             QMessageBox.warning(
-                self, "Input directory", "Please select a directory with raw FITS files."
+                self,
+                "Input directory",
+                "Please select a directory with raw FITS files.",
             )
             return None
         path = Path(text)
         if not path.is_dir():
-            QMessageBox.warning(self, "Input directory", f"'{path}' is not a directory.")
+            QMessageBox.warning(
+                self, "Input directory", f"'{path}' is not a directory."
+            )
             return None
         return path
 
     def _browse_input_dir(self) -> None:
-        dir_path = QFileDialog.getExistingDirectory(self, "Select raw FITS directory")
+        dir_path = QFileDialog.getExistingDirectory(
+            self, "Select raw FITS directory"
+        )
         if dir_path:
             self.txt_input_dir.setText(dir_path)
 
@@ -515,7 +576,9 @@ class MainWindow(QMainWindow):
         base_list = calib_prep_lists.build_lists_from_directory(str(input_dir))
         self.lbl_status.setText(f"Prepared lists from {input_dir.name} → {base_list}")
         QMessageBox.information(
-            self, "Lists created", f"Calibration lists created for '{input_dir.name}'."
+            self,
+            "Lists created",
+            f"Calibration lists created for '{input_dir.name}'.",
         )
 
     def _run_create_masters(self) -> None:
@@ -524,272 +587,305 @@ class MainWindow(QMainWindow):
             return
         cfg, input_dir = res
 
-        # Here we call your command-line style scripts programmatically.
-        # Adjust list names to match calib_prep_lists SUFFIXES if needed.
-        base_name = input_dir.name
-        list_in = Path(f"{base_name}.lst")
-        list_b = Path(f"{base_name}-b.lst")
+        from calibration import mkmasterbias, mkmasterdark, mkmasterflats
 
-        from calibration.mkmasterbias import create_master_bias  # type: ignore
-        from calibration.mkmasterdark import find_dark_frames, make_master_dark  # type: ignore
-        from calibration.mkmasterflats import process_flats  # type: ignore
-        from calibration.calib_prep_lists import read_list_file  # type: ignore
-
-        if not list_in.is_file():
+        # Use pipeline-style collection of files (same as calib_core)
+        dir_path = Path(str(input_dir)).expanduser().resolve()
+        fits_files = sorted(
+            str(p.resolve())
+            for p in dir_path.iterdir()
+            if p.is_file() and p.suffix in {".fits", ".fit", ".FITS", ".FIT"}
+        )
+        if not fits_files:
             QMessageBox.warning(
-                self,
-                "Master frames",
-                f"List file '{list_in}' not found. Run 'Prepare file lists' first.",
-            )
-            return
-
-        if not list_b.is_file():
-            QMessageBox.warning(
-                self,
-                "Master frames",
-                f"List file '{list_b}' not found. Run 'Prepare file lists' first.",
+                self, "Master frames", "No FITS files found in the selected directory."
             )
             return
 
         # Master bias
-        files = read_list_file(list_in)  # list[str] of filenames
-        create_master_bias(files)  # uses config inside that module
+        masterbias_path = mkmasterbias.create_master_bias(
+            fits_files,
+            cfg,
+            output_filename="masterbias.fits",
+            method=cfg.get("IMAGE_PROCESSING", "bias_subtraction_method"),
+            sigma=cfg.get("IMAGE_PROCESSING", "bias_subtraction_sigma"),
+            make_png_flag=False,
+            verbose=True,
+        )
 
         # Master dark
-        dark_candidates = read_list_file(list_b)
-        dark_files = find_dark_frames(dark_candidates)
-        if dark_files:
-            make_master_dark(dark_files, "masterdark.fits")
+        masterdark_path = mkmasterdark.make_master_dark(
+            fits_files,
+            cfg,
+            output_filename="masterdark.fits",
+            method=cfg.get("IMAGE_PROCESSING", "dark_correction_method"),
+            make_png_flag=False,
+            verbose=True,
+        )
 
         # Master flats
-        flats_files = read_list_file(list_b)
-        process_flats(flats_files)
+        mkmasterflats.create_master_flats(fits_files, cfg, verbose=True)
 
         QMessageBox.information(
             self,
             "Master frames",
-            "Master bias/dark/flats have been created (see work/ & results/aux).",
+            f"Master bias created at:\n{masterbias_path}\n\n"
+            f"Master dark created at:\n{masterdark_path}\n\n"
+            "Master flats created (see work/ and results/aux).",
         )
 
     def _run_full_calibration(self) -> None:
+        """
+        Run full CCD calibration pipeline via CalibrationPipeline.
+
+        All work/results/aux directories are created INSIDE the selected
+        raw directory, e.g. Gaia19cuu/work, Gaia19cuu/results, Gaia19cuu/results/aux.
+        """
         res = self._ensure_config_and_dir()
         if res is None:
             return
         cfg, input_dir = res
 
-        # TODO: hook your real full calibration pipeline here.
+        if self.current_config_path is None:
+            QMessageBox.warning(
+                self, "Config", "No config file path found for the selected profile."
+            )
+            return
+
+        # *** important: use the selected directory as root_dir ***
+        try:
+            pipeline = CalibrationPipeline(
+                str(self.current_config_path),
+                root_dir=str(input_dir),  # <— this is new
+            )
+        except TypeError:
+            # fallback if older CalibrationPipeline without root_dir argument
+            pipeline = CalibrationPipeline(str(self.current_config_path))
+
+        log_lines: List[str] = []
+
+        def log(msg: str) -> None:
+            log_lines.append(msg)
+            print(msg)
+
+        try:
+            final_files = pipeline.run_full_calibration(
+                raw_source=str(input_dir),
+                source_type="directory",
+                verbose=True,
+                log_callback=log,
+            )
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(
+                self,
+                "Calibration error",
+                f"Full calibration failed:\n{e}",
+            )
+            return
+
+        # If pipeline returned nothing, still try to pick up any -bdf frames from results/.
+        if not final_files:
+            results_dir = Path(input_dir) / "results"
+            if results_dir.is_dir():
+                final_files = [
+                    str(p)
+                    for p in sorted(results_dir.glob("*.fits"))
+                    if "-bdf" in p.name.lower()
+                ]
+
+        self.calibrated_files = [Path(p) for p in final_files]
+
+        self.lbl_status.setText(
+            f"Calibration complete: {len(self.calibrated_files)} calibrated science frames."
+        )
+
+        preview_count = min(5, len(self.calibrated_files))
+        preview_names = "\n".join(p.name for p in self.calibrated_files[:preview_count])
+        extra = ""
+        if len(self.calibrated_files) > preview_count:
+            extra = f"\n… and {len(self.calibrated_files) - preview_count} more."
+
         QMessageBox.information(
             self,
             "Full calibration",
-            "Here you will hook your full calibration pipeline\n"
-            "(bias + dark + flats + science calibration).",
+            f"Calibration finished.\n"
+            f"Config: {Path(self.current_config_path).name}\n"
+            f"Input directory: {input_dir}\n"
+            f"Calibrated frames: {len(self.calibrated_files)}\n\n"
+            f"Examples:\n{preview_names}{extra}",
         )
 
-        # After the pipeline, try to discover calibrated frames
-        self._find_calibrated_frames()
+        # Show 'Upload to BHTOM' if we have frames
+        self.btn_upload_calibrated.setVisible(bool(self.calibrated_files))
+        self.btn_upload_calibrated.setEnabled(
+            bool(self.calibrated_files) and self.bhtom_token is not None
+        )
 
-    def _find_calibrated_frames(self) -> None:
-        """Heuristic: look for calibrated FITS files in results_dir or its 'calibrated' subfolder."""
-        self.calibrated_files = []
-        if self.current_config is None:
-            self.btn_upload_bhtom.setVisible(False)
-            return
-
-        results_dir_str = self.current_config.get("DATA_STRUCTURE", "results_dir")
-        results_dir = Path(results_dir_str)
-        if not results_dir.is_absolute():
-            results_dir = ROOT_DIR / results_dir
-
-        candidates: List[Path] = []
-
-        calib_dir = results_dir / "calibrated"
-        if calib_dir.is_dir():
-            candidates.extend(sorted(calib_dir.glob("*.fit*")))
-        elif results_dir.is_dir():
-            candidates.extend(sorted(results_dir.glob("*.fit*")))
-
-        self.calibrated_files = candidates
-        has_files = bool(self.calibrated_files)
-        self.btn_upload_bhtom.setVisible(has_files)
-
-        if has_files:
-            self.lbl_status.setText(
-                f"Calibration completed: {len(self.calibrated_files)} calibrated frame(s) found."
-            )
-        else:
-            self.lbl_status.setText("Calibration completed, but no calibrated frames were found.")
+        # Automatically open first calibrated frame in the viewer
+        if self.calibrated_files:
+            try:
+                arr = fits.getdata(str(self.calibrated_files[0])).astype(np.float32)
+                self.loaded_frames = [(self.calibrated_files[0], arr)]
+                self.current_frame_index = 0
+                self._show_current_frame()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
-    # BHTOM integration – session + login
+    # BHTOM integration
     # ------------------------------------------------------------------
-    def _restore_bhtom_session(self) -> None:
-        """Restore BHTOM session from saved credentials, if any."""
-        username, token = bhtom_api.load_credentials()
-        if username and token:
-            self.bhtom_username = username
-            self.bhtom_token = token
-            self.lbl_status.setText(f"BHTOM: restored session as {username}")
-        # lbl_bhtom_status is created later in _build_tab_integrations,
-        # but we may call _restore_bhtom_session() before that.
-        # So we update UI after tabs are built, in __init__.
-        # Here we just ensure attributes exist when UI is ready.
-        # _update_bhtom_ui() is called in _build_tab_integrations via __init__
-        # after central widget is created.
-
-    def _update_bhtom_ui(self) -> None:
-        if getattr(self, "lbl_bhtom_status", None) is None:
-            return
-        if self.bhtom_token:
-            self.lbl_bhtom_status.setText(f"Connected as {self.bhtom_username}")
-            self.btn_bhtom_connect.setText("Disconnect")
-        else:
-            self.lbl_bhtom_status.setText("Not connected")
-            self.btn_bhtom_connect.setText("Connect to BHTOM…")
-
-    def _on_bhtom_connect_clicked(self) -> None:
-        if self.bhtom_token:
-            # Already connected → offer logout
-            resp = QMessageBox.question(
-                self,
-                "Disconnect BHTOM",
-                "You are currently connected to BHTOM.\n"
-                "Do you want to disconnect this account?",
-                QMessageBox.Yes | QMessageBox.No,
-                QMessageBox.No,
-            )
-            if resp == QMessageBox.Yes:
-                self.bhtom_token = None
-                self.bhtom_username = None
-                bhtom_api.clear_credentials()
-                self._update_bhtom_ui()
-                self.lbl_status.setText("BHTOM: disconnected")
-            return
-
-        # Not connected → open login dialog
-        self._connect_bhtom()
-
     def _connect_bhtom(self) -> None:
         dlg = BHTOMLoginDialog(self)
         if dlg.exec() != QDialog.Accepted:
-            # User cancelled or closed dialog
             return
 
-        if not dlg.username or not dlg.token:
-            # "Continue without login"
+        username = dlg.username
+        token = dlg.token
+        remember = dlg.remember_me
+
+        if not username or not token:
+            QMessageBox.warning(
+                self, "BHTOM", "No valid session returned from login dialog."
+            )
             return
 
-        self.bhtom_username = dlg.username
-        self.bhtom_token = dlg.token
-
-        if dlg.remember_me:
-            bhtom_api.save_credentials(dlg.username, dlg.token)
+        if remember:
+            bhtom_api.save_credentials(username, token)
         else:
             bhtom_api.clear_credentials()
 
-        self._update_bhtom_ui()
+        self.bhtom_username = username
+        self.bhtom_token = token
         self.lbl_status.setText("BHTOM: authenticated")
+        self._refresh_bhtom_ui()
 
-    def _ensure_bhtom_logged_in(self) -> bool:
-        """Return True if we have a valid BHTOM token; otherwise prompt login."""
-        if self.bhtom_token:
-            return True
-        self._connect_bhtom()
-        return self.bhtom_token is not None
+        # If we already have calibrated frames, allow upload
+        if self.calibrated_files:
+            self.btn_upload_calibrated.setEnabled(True)
 
-    # ------------------------------------------------------------------
-    # Upload calibrated frames to BHTOM
-    # ------------------------------------------------------------------
-    def _on_upload_calibrated_to_bhtom(self) -> None:
+    def _on_upload_calibrated_clicked(self) -> None:
+        """
+        Upload currently calibrated files (self.calibrated_files) to BHTOM
+        using the REST API from bhtom_api.upload_calibrated_files.
+        """
+        # 1) Ensure we have calibrated frames
         if not self.calibrated_files:
-            QMessageBox.information(
+            QMessageBox.warning(
                 self,
-                "No calibrated frames",
-                "No calibrated frames were detected for upload.\n"
-                "Run the full calibration first.",
+                "Upload to BHTOM",
+                "No calibrated frames available. Run '3. Run full calibration' first.",
             )
             return
 
-        if not self._ensure_bhtom_logged_in():
-            return
+        # 2) Ensure user is logged in
+        if not self.bhtom_token:
+            self._connect_bhtom()
+            if not self.bhtom_token:
+                # user cancelled login
+                return
 
-        # Preview list of files
+        # 3) Quick preview/confirmation of what will be uploaded
         max_preview = 10
-        file_lines = [f"- {p.name}" for p in self.calibrated_files[:max_preview]]
+        names = [p.name for p in self.calibrated_files[:max_preview]]
+        preview = "\n".join(names)
+        extra = ""
         if len(self.calibrated_files) > max_preview:
-            file_lines.append(f"... and {len(self.calibrated_files) - max_preview} more")
+            extra = f"\n… and {len(self.calibrated_files) - max_preview} more"
 
-        preview_text = (
-            f"User: {self.bhtom_username}\n"
-            f"Config: {self.current_config_path.name if self.current_config_path else '—'}\n\n"
-            f"Ready to upload {len(self.calibrated_files)} calibrated frame(s) to BHTOM.\n\n"
-            "Files:\n" + "\n".join(file_lines) + "\n\n"
-            "Do you want to continue?"
-        )
-
-        resp = QMessageBox.question(
+        answer = QMessageBox.question(
             self,
             "Upload calibrated frames to BHTOM",
-            preview_text,
+            f"User: {self.bhtom_username or 'unknown'}\n"
+            f"Frames to upload: {len(self.calibrated_files)}\n\n"
+            f"Preview:\n{preview}{extra}\n\n"
+            "Do you want to proceed?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes,
         )
-        if resp != QMessageBox.Yes:
+        if answer != QMessageBox.Yes:
             return
 
-        self._do_bhtom_upload()
-
-    def _do_bhtom_upload(self) -> None:
-        if not self.bhtom_token:
-            return
-
-        # Ask user for required metadata.
-        target, ok = QInputDialog.getText(
-            self, "Target name", "BHTOM target name:"
-        )
-        if not ok or not target.strip():
-            return
-
-        default_obs = self.lbl_obs_name.text()
-        if default_obs == "—":
-            default_obs = ""
-        observatory, ok = QInputDialog.getText(
+        # 4) Ask for target name
+        default_target = self.last_bhtom_target or ""
+        target_name, ok = QInputDialog.getText(
             self,
-            "Observatory",
-            "Observatory name in BHTOM:",
-            text=default_obs,
+            "BHTOM target name",
+            "Enter existing BHTOM target name:",
+            QLineEdit.Normal,
+            default_target,
         )
-        if not ok or not observatory.strip():
+        if not ok or not target_name.strip():
             return
+        target_name = target_name.strip()
 
+        # 5) Ask for observatory ONAME
+        #    (example: 'AZT-8_C4-16000', 'BIALKOW_ANDOR-DW432', etc.)
+        default_oname = self.last_bhtom_observatory or ""
+        observatory_oname, ok = QInputDialog.getText(
+            self,
+            "Observatory / camera ONAME",
+            "Enter observatory/camera ONAME (e.g. 'AZT-8_C4-16000'):",
+            QLineEdit.Normal,
+            default_oname,
+        )
+        if not ok or not observatory_oname.strip():
+            return
+        observatory_oname = observatory_oname.strip()
+
+        # 6) Ask for filter string (optional – default GaiaSP/any)
+        default_filter = self.last_bhtom_filter or "GaiaSP/any"
         filter_name, ok = QInputDialog.getText(
             self,
-            "Filter",
-            "Filter name:",
-            text="GaiaSP/any",
+            "Filter identifier",
+            "Enter BHTOM filter name (e.g. 'GaiaSP/any').\n"
+            "Leave empty to use the default:",
+            QLineEdit.Normal,
+            default_filter,
         )
-        if not ok or not filter_name.strip():
+        if not ok:
             return
+        filter_name = (filter_name or "").strip() or "GaiaSP/any"
 
+        # 7) Remember last used values for convenience
+        self.last_bhtom_target = target_name
+        self.last_bhtom_observatory = observatory_oname
+        self.last_bhtom_filter = filter_name
+
+        # 8) Perform upload
+        paths = [Path(p) for p in self.calibrated_files]
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             bhtom_api.upload_calibrated_files(
-                self.calibrated_files,
-                self.bhtom_token,
-                target.strip(),
-                observatory.strip(),
-                filter_name.strip(),
+                files=paths,
+                token=self.bhtom_token,
+                target=target_name,
+                observatory=observatory_oname,
+                filter_name=filter_name,
             )
-        except bhtom_api.BHTOMUploadError as exc:  # type: ignore[attr-defined]
+        except bhtom_api.BHTOMUploadError as exc:
+            QApplication.restoreOverrideCursor()
             QMessageBox.critical(self, "Upload failed", str(exc))
             return
+        except Exception as exc:  # safety net
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(
+                self,
+                "Unexpected error",
+                f"An unexpected error occurred while uploading:\n{exc}",
+            )
+            return
+        finally:
+            QApplication.restoreOverrideCursor()
 
+        # 9) Success message
         QMessageBox.information(
             self,
-            "Upload finished",
-            f"Uploaded {len(self.calibrated_files)} calibrated frame(s) to BHTOM.",
+            "Upload completed",
+            (
+                f"Successfully uploaded {len(paths)} calibrated file(s) to BHTOM.\n\n"
+                f"Target: {target_name}\n"
+                f"Observatory: {observatory_oname}\n"
+                f"Filter: {filter_name}"
+            ),
         )
-        self.lbl_status.setText("BHTOM: upload finished")
-
-    # After UI is fully built, make sure BHTOM status label matches session
-    def showEvent(self, event) -> None:
-        super().showEvent(event)
-        self._update_bhtom_ui()

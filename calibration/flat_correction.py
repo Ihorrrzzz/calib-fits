@@ -31,7 +31,7 @@ def apply_flat_correction(
     list_out: str,
     cfg: CalibConfig,
     verbose: bool = False,
-) -> None:
+) -> List[str]:
     """
     Divide science (OBJECT) images by normalized master flats.
 
@@ -40,6 +40,8 @@ def apply_flat_correction(
       - HEADER_SPECIFICATION.filters_keyword
       - HEADER_SPECIFICATION.filters (valid filters)
       - DATA_STRUCTURE.working_dir / results_dir / results_aux_dir
+
+    Returns list of calibrated science image filenames.
     """
     working_dir = Path(cfg.get("DATA_STRUCTURE", "working_dir", "./work"))
     results_dir = Path(cfg.get("DATA_STRUCTURE", "results_dir", "./results"))
@@ -131,9 +133,11 @@ def apply_flat_correction(
         if verbose:
             print(f"[flat_correction] Output list written to {list_out}")
             print("[flat_correction] Calibrated science images are in results_dir.")
+        return output_files
     else:
         if verbose:
             print("[flat_correction] No files were flat-corrected.")
+        return []
 
 
 def main(argv: Optional[list[str]] = None) -> None:

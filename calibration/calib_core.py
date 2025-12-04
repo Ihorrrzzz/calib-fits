@@ -72,6 +72,10 @@ class CalibrationPipeline:
         if not input_files:
             raise RuntimeError("No FITS files found for calibration.")
 
+        # Base list of raw files
+        list_raw = self.working_dir / "pipeline_raw.lst"
+        self._write_list(list_raw, input_files)
+
         img_proc_cfg = self.full_config.get("IMAGE_PROCESSING", {})
 
         # ------------------ Bias --------------------------------------
@@ -84,21 +88,24 @@ class CalibrationPipeline:
                 output_filename="masterbias.fits",
                 method=img_proc_cfg.get("bias_subtraction_method"),
                 sigma=img_proc_cfg.get("bias_subtraction_sigma", 2.5),
-                make_png=False,
+                make_png_flag=False,
                 verbose=verbose,
             )
 
             log("=== BIAS CORRECTION ===")
+            list_b = self.working_dir / "pipeline_bias_corrected.lst"
             bias_corrected_files = bias_correction.apply_bias_correction(
-                input_files,
-                masterbias_path,
-                self.cfg,
+                list_in=str(list_raw),
+                list_out=str(list_b),
+                masterbias_file=masterbias_path,
+                cfg=self.cfg,
                 verbose=verbose,
             )
         else:
             log("Bias subtraction disabled in config; skipping bias steps.")
             bias_corrected_files = list(input_files)
-            masterbias_path = None  # noqa: F841 (might later be used)
+            masterbias_path = None  # noqa: F841
+            list_b = list_raw
 
         # ------------------ Dark --------------------------------------
         dark_enabled = img_proc_cfg.get("dark_correction", True)
@@ -109,21 +116,24 @@ class CalibrationPipeline:
                 self.cfg,
                 output_filename="masterdark.fits",
                 method=img_proc_cfg.get("dark_correction_method"),
-                make_png=False,
+                make_png_flag=False,
                 verbose=verbose,
             )
 
             log("=== DARK CORRECTION ===")
+            list_bd = self.working_dir / "pipeline_dark_corrected.lst"
             dark_corrected_files = dark_correction.apply_dark_correction(
-                bias_corrected_files,
-                masterdark_path,
-                self.cfg,
+                list_in=str(list_b),
+                list_out=str(list_bd),
+                masterdark_file=masterdark_path,
+                cfg=self.cfg,
                 verbose=verbose,
             )
         else:
             log("Dark correction disabled in config; skipping dark steps.")
             dark_corrected_files = list(bias_corrected_files)
             masterdark_path = None  # noqa: F841
+            list_bd = list_b
 
         # ------------------ Flats & science ---------------------------
         flat_enabled = img_proc_cfg.get("flat_correction", True)
@@ -140,9 +150,11 @@ class CalibrationPipeline:
                     log(f"Filter {filt}: masterflat={mf}, masterflat_norm={mfn}")
 
             log("=== FLAT CORRECTION (SCIENCE FRAMES) ===")
+            list_bdf = self.working_dir / "pipeline_flat_corrected.lst"
             final_files = flat_correction.apply_flat_correction(
-                dark_corrected_files,
-                self.cfg,
+                list_in=str(list_bd),
+                list_out=str(list_bdf),
+                cfg=self.cfg,
                 verbose=verbose,
             )
         else:
@@ -156,6 +168,13 @@ class CalibrationPipeline:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+    @staticmethod
+    def _write_list(path: Path, items: List[str]) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            for it in items:
+                f.write(str(it) + "\n")
+
     def _collect_input_files(
         self,
         raw_source: str,
@@ -172,7 +191,7 @@ class CalibrationPipeline:
             if not p.is_dir():
                 raise FileNotFoundError(f"Directory not found: {p}")
             files = sorted(
-                str(f)
+                str(f.resolve())
                 for f in p.iterdir()
                 if f.suffix in self.FITS_EXTENSIONS and f.is_file()
             )

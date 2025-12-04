@@ -32,10 +32,12 @@ def apply_bias_correction(
     masterbias_file: str,
     cfg: CalibConfig,
     verbose: bool = False,
-) -> None:
+) -> List[str]:
     """
     Subtract masterbias from all frames that are NOT bias frames.
     Uses HEADER_SPECIFICATION.image_type_keyword and BIAS_SUBTRACTION.bias_keyword.
+
+    Returns list of output filenames that were bias-corrected.
     """
     masterbias_path = Path(masterbias_file)
     if not masterbias_path.is_file():
@@ -91,9 +93,11 @@ def apply_bias_correction(
         _write_list(Path(list_out), out_files)
         if verbose:
             print(f"[bias_correction] Output list written to {list_out}")
+        return out_files
     else:
         if verbose:
             print("[bias_correction] No files were bias-corrected.")
+        return []
 
 
 def main(argv: Optional[list[str]] = None) -> None:
